@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"fmt"
 	"time"
 
 	"dns-cache/cache"
@@ -71,7 +72,7 @@ func QtypeName(qtype uint16) string {
 	if name, ok := names[qtype]; ok {
 		return name
 	}
-	return "?"
+	return fmt.Sprintf("TYPE%d", qtype)
 }
 
 func sortDomainStats(stats []DomainStat) {
