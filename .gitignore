@@ -1,0 +1,6 @@
+dns-cache
+*.db
+*.db-wal
+*.db-shm
+*.sock
+/tmp/

@@ -1,0 +1,20 @@
+listen: ":53"
+
+upstreams:
+  - "1.1.1.1:53"
+  - "9.9.9.9:53"
+  - "8.8.8.8:53"
+
+cache:
+  ttl_min: 60
+  ttl_max: 86400
+  refresh_interval: 30
+  stale_serving: true
+  max_entries: 10000
+
+persistence:
+  db_path: "/var/cache/dns-cache/cache.db"
+  cleanup_after_hours: 48
+
+stats:
+  socket_path: "/var/run/dns-cache.sock"
