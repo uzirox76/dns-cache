@@ -15,7 +15,7 @@ A lightweight, high-performance local DNS caching server for Linux. Written in G
 - **NXDOMAIN caching** — caches negative responses with SOA MinTTL (RFC 2308)
 - **LRU eviction** — drops least recently used entries when cache is full
 - **CLI stats** — `dns-cache -stats` for live JSON stats via Unix socket
-- **Web dashboard** — `http://localhost:8080` with auto-refresh HTML + JSON API
+- **Web dashboard** — `http://localhost:8053` with auto-refresh HTML + JSON API
 - **systemd integration** — service file included, `CAP_NET_BIND_SERVICE` for port 53
 - **Zero dependencies** — single static binary, ~13MB
 
@@ -50,7 +50,7 @@ persistence:
 stats:
   socket_path: "/var/run/dns-cache.sock"
 web:
-  listen: ":8080"
+  listen: ":8053"
 ```
 
 ### 3. Install as a systemd service
@@ -84,7 +84,7 @@ echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf
 ```bash
 dig @127.0.0.1 google.com A +short
 dns-cache -stats
-# or open http://localhost:8080
+# or open http://localhost:8053
 ```
 
 ## Commands

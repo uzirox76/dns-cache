@@ -56,7 +56,7 @@ func DefaultConfig() *Config {
 			SocketPath: "/var/run/dns-cache.sock",
 		},
 		WebCfg: WebConfig{
-			Listen: "",
+			Listen: ":8053",
 		},
 	}
 }
