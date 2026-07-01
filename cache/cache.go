@@ -8,12 +8,16 @@ import (
 )
 
 type Stats struct {
-	Entries     int     `json:"entries"`
-	Hits        uint64  `json:"hits"`
-	Misses      uint64  `json:"misses"`
-	StaleServes uint64  `json:"stale_serves"`
-	Errors      uint64  `json:"errors"`
-	HitRatio    float64 `json:"hit_ratio"`
+	Entries      int     `json:"entries"`
+	MaxEntries   int     `json:"max_entries"`
+	Hits         uint64  `json:"hits"`
+	Misses       uint64  `json:"misses"`
+	StaleServes  uint64  `json:"stale_serves"`
+	Errors       uint64  `json:"errors"`
+	HitRatio     float64 `json:"hit_ratio"`
+	TotalQueries uint64  `json:"total_queries"`
+	QPSHistory   []int   `json:"qps_history"`
+	AvgQPS       float64 `json:"avg_qps"`
 }
 
 type Config struct {
@@ -31,6 +35,10 @@ type Cache struct {
 	stale   uint64
 	errs    uint64
 	config  Config
+
+	totalQueries uint64
+	qpsRing      [60]int
+	qpsBase      int64
 }
 
 func New(cfg Config) *Cache {
@@ -191,14 +199,76 @@ func (c *Cache) Stats() Stats {
 	if total > 0 {
 		ratio = float64(c.hits) / float64(total) * 100
 	}
-	return Stats{
-		Entries:     len(c.entries),
-		Hits:        c.hits,
-		Misses:      c.misses,
-		StaleServes: c.stale,
-		Errors:      c.errs,
-		HitRatio:    ratio,
+
+	var sum int
+	for _, v := range c.qpsRing {
+		sum += v
 	}
+	var avgQPS float64
+	window := 60
+	if c.qpsBase > 0 {
+		elapsed := time.Now().Unix() - c.qpsBase
+		if elapsed > 0 && int(elapsed) < window {
+			window = int(elapsed)
+		}
+	}
+	if window > 0 {
+		avgQPS = float64(sum) / float64(window)
+	}
+
+	qpsHist := make([]int, len(c.qpsRing))
+	copy(qpsHist, c.qpsRing[:])
+
+	return Stats{
+		Entries:      len(c.entries),
+		MaxEntries:   c.config.MaxEntries,
+		Hits:         c.hits,
+		Misses:       c.misses,
+		StaleServes:  c.stale,
+		Errors:       c.errs,
+		HitRatio:     ratio,
+		TotalQueries: c.totalQueries,
+		QPSHistory:   qpsHist,
+		AvgQPS:       avgQPS,
+	}
+}
+
+func (c *Cache) IncrQueries() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.trackQPS()
+}
+
+func (c *Cache) trackQPS() {
+	now := time.Now().Unix()
+	c.totalQueries++
+
+	if c.qpsBase == 0 {
+		c.qpsBase = now
+	}
+
+	sec := int(now - c.qpsBase)
+	if sec >= 60 {
+		shift := sec - 59
+		if shift >= 60 {
+			c.qpsBase = now
+			c.qpsRing = [60]int{}
+			c.qpsRing[0] = 1
+			return
+		}
+		copy(c.qpsRing[:], c.qpsRing[shift:])
+		for i := 60 - shift; i < 60; i++ {
+			c.qpsRing[i] = 0
+		}
+		c.qpsBase += int64(shift)
+		sec = 59
+	} else if sec < 0 {
+		c.qpsBase = now
+		c.qpsRing = [60]int{}
+		c.qpsRing[0] = 1
+		return
+	}
+	c.qpsRing[sec]++
 }
 
 func (c *Cache) IncrErrors() {

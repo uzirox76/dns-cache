@@ -22,6 +22,8 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
+	h.cache.IncrQueries()
+
 	q := req.Question[0]
 	key := cache.Key(q.Name, q.Qtype)
 
