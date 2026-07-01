@@ -98,12 +98,14 @@ func runServer(configPath string) {
 			log.Printf("[persist] loaded %d entries from %s", len(entries), cfg.PersistCfg.DBPath)
 		}
 
-		go persistLoop(c, p)
+		persistStop := make(chan struct{})
+		go persistLoop(c, p, persistStop)
 
 		cleanupAfter := time.Duration(cfg.PersistCfg.CleanupAfter) * time.Hour
 		if cleanupAfter > 0 {
-			go cleanupLoop(p, cleanupAfter)
+			go cleanupLoop(p, cleanupAfter, persistStop)
 		}
+		defer close(persistStop)
 	}
 
 	resolver := NewResolver(cfg.Upstreams, 5*time.Second)
@@ -165,32 +167,41 @@ func runServer(configPath string) {
 	log.Print("[shutdown] server stopped")
 }
 
-func persistLoop(c *cache.Cache, p *Persistence) {
+func persistLoop(c *cache.Cache, p *Persistence, stop <-chan struct{}) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		snapshot := c.Snapshot()
-		var saved int
-		for _, e := range snapshot {
-			if e.HitCount > 0 {
-				if err := p.SaveEntry(e); err != nil {
-					log.Printf("[persist] save error: %v", err)
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			snapshot := c.Snapshot()
+			var saved int
+			for _, e := range snapshot {
+				if e.HitCount > 0 {
+					if err := p.SaveEntry(e); err != nil {
+						log.Printf("[persist] save error: %v", err)
+					}
+					saved++
 				}
-				saved++
 			}
-		}
-		if saved > 0 {
-			log.Printf("[persist] saved %d entries", saved)
+			if saved > 0 {
+				log.Printf("[persist] saved %d entries", saved)
+			}
 		}
 	}
 }
 
-func cleanupLoop(p *Persistence, after time.Duration) {
+func cleanupLoop(p *Persistence, after time.Duration, stop <-chan struct{}) {
 	for {
-		time.Sleep(1 * time.Hour)
-		if _, err := p.Cleanup(after); err != nil {
-			log.Printf("[cleanup] error: %v", err)
+		select {
+		case <-stop:
+			return
+		case <-time.After(1 * time.Hour):
+			if _, err := p.Cleanup(after); err != nil {
+				log.Printf("[cleanup] error: %v", err)
+			}
 		}
 	}
 }

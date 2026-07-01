@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"html/template"
 	"log"
@@ -47,7 +48,9 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() {
 	if s.srv != nil {
-		s.srv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.srv.Shutdown(ctx)
 	}
 }
 

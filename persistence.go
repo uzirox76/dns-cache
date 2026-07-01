@@ -56,10 +56,6 @@ func NewPersistence(dbPath string) (*Persistence, error) {
 		return nil, err
 	}
 
-	if _, err := db.Exec(`ALTER TABLE cache_entries ADD COLUMN cached_ttl INTEGER NOT NULL DEFAULT 0`); err != nil {
-		// column already exists — ignore
-	}
-
 	return &Persistence{db: db, dbPath: dbPath}, nil
 }
 

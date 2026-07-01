@@ -95,16 +95,15 @@ func (c *Cache) GetStale(key string) (*Entry, bool) {
 
 func (c *Cache) Set(qname string, qtype uint16, resp *dns.Msg, originalTTL uint32) {
 	if len(resp.Answer) == 0 {
-		// NXDOMAIN/NODATA — extract TTL from SOA (RFC 2308)
 		for _, rr := range resp.Ns {
 			if soa, ok := rr.(*dns.SOA); ok {
 				originalTTL = soa.Minttl
 				break
 			}
 		}
-		if originalTTL == 0 {
-			originalTTL = 60
-		}
+	}
+	if originalTTL == 0 {
+		originalTTL = 60
 	}
 
 	ttl := time.Duration(originalTTL) * time.Second
@@ -180,7 +179,8 @@ func (c *Cache) Snapshot() map[string]*Entry {
 	defer c.mu.RUnlock()
 	m := make(map[string]*Entry, len(c.entries))
 	for k, v := range c.entries {
-		m[k] = v
+		vc := *v
+		m[k] = &vc
 	}
 	return m
 }

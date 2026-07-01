@@ -63,9 +63,6 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if len(resp.Answer) > 0 {
 		originalTTL = resp.Answer[0].Header().Ttl
 	}
-	if originalTTL == 0 {
-		originalTTL = 60
-	}
 
 	h.cache.Set(q.Name, q.Qtype, resp, originalTTL)
 

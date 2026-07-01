@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -26,7 +27,7 @@ func (r *Resolver) Resolve(msg *dns.Msg) (*dns.Msg, string, time.Duration, error
 	}
 
 	indices := rand.Perm(len(r.upstreams))
-	var lastErr error
+	var errs []string
 
 	for _, idx := range indices {
 		upstream := r.upstreams[idx]
@@ -40,9 +41,9 @@ func (r *Resolver) Resolve(msg *dns.Msg) (*dns.Msg, string, time.Duration, error
 			return resp, upstream, rtt, nil
 		}
 		if err != nil {
-			lastErr = err
+			errs = append(errs, err.Error())
 		}
 	}
 
-	return nil, "", 0, fmt.Errorf("all upstreams failed: %w", lastErr)
+	return nil, "", 0, fmt.Errorf("all upstreams failed: %s", strings.Join(errs, "; "))
 }

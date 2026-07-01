@@ -2,6 +2,7 @@ package stats
 
 import (
 	"encoding/json"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -77,5 +78,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	snap := BuildSnapshot(s.store, s.startedAt)
 	data, _ := json.MarshalIndent(snap, "", "  ")
 	data = append(data, '\n')
-	conn.Write(data)
+	if _, err := conn.Write(data); err != nil {
+		log.Printf("[stats] write error: %v", err)
+	}
 }
