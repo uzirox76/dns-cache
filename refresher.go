@@ -36,8 +36,19 @@ func (rf *Refresher) Start() {
 
 func (rf *Refresher) Stop() {
 	close(rf.stopCh)
-	rf.wg.Wait()
-	log.Print("[refresher] stopped")
+
+	done := make(chan struct{})
+	go func() {
+		rf.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Print("[refresher] stopped")
+	case <-time.After(6 * time.Second):
+		log.Print("[refresher] stop: timeout, abandoning workers")
+	}
 }
 
 func (rf *Refresher) loop() {
@@ -89,6 +100,11 @@ func (rf *Refresher) refreshCycle() {
 		return
 	}
 
+	// ponytail: cap altrimenti Stop() aspetta tutto
+	if len(toRefresh) > 500 {
+		toRefresh = toRefresh[:500]
+	}
+
 	sort.Slice(toRefresh, func(i, j int) bool {
 		ie := toRefresh[i].IsExpired()
 		je := toRefresh[j].IsExpired()
@@ -107,6 +123,12 @@ func (rf *Refresher) refreshCycle() {
 	var wg sync.WaitGroup
 
 	for _, e := range toRefresh {
+		select {
+		case <-rf.stopCh:
+			wg.Wait()
+			return
+		default:
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(entry *cache.Entry) {
