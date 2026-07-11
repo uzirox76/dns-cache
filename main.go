@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -86,7 +87,6 @@ func runServer(configPath string) {
 		if err != nil {
 			log.Fatalf("[persist] init: %v", err)
 		}
-		defer p.Close()
 
 		entries, err := p.LoadAll()
 		if err != nil {
@@ -99,13 +99,28 @@ func runServer(configPath string) {
 		}
 
 		persistStop := make(chan struct{})
-		go persistLoop(c, p, persistStop)
+		var persistWg sync.WaitGroup
+
+		persistWg.Add(1)
+		go func() {
+			defer persistWg.Done()
+			persistLoop(c, p, persistStop)
+		}()
 
 		cleanupAfter := time.Duration(cfg.PersistCfg.CleanupAfter) * time.Hour
 		if cleanupAfter > 0 {
-			go cleanupLoop(p, cleanupAfter, persistStop)
+			persistWg.Add(1)
+			go func() {
+				defer persistWg.Done()
+				cleanupLoop(p, cleanupAfter, persistStop)
+			}()
 		}
-		defer close(persistStop)
+
+		defer func() {
+			close(persistStop)
+			persistWg.Wait()
+			p.Close()
+		}()
 	}
 
 	resolver := NewResolver(cfg.Upstreams, 5*time.Second)
