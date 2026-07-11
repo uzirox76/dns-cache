@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/miekg/dns"
@@ -35,7 +36,7 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	resp, upstream, rtt, err := h.resolver.Resolve(req)
+	resp, upstream, rtt, err := h.resolver.Resolve(context.Background(), req)
 	if err != nil {
 		h.cache.IncrErrors()
 		log.Printf("[error] resolve %s: %v", q.Name, err)

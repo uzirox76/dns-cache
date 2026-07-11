@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"sort"
 	"sync"
@@ -149,7 +150,7 @@ func (rf *Refresher) refreshEntry(e *cache.Entry) {
 	m := new(dns.Msg)
 	m.SetQuestion(e.QuestionName, e.QuestionType)
 
-	resp, _, _, err := rf.resolver.Resolve(m)
+	resp, _, _, err := rf.resolver.Resolve(context.Background(), m)
 	if err != nil {
 		log.Printf("[refresher] refresh %s %s failed: %v",
 			dns.TypeToString[e.QuestionType], e.QuestionName, err)
