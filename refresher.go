@@ -129,8 +129,8 @@ func (rf *Refresher) refreshCycle() {
 			return
 		default:
 		}
-		wg.Add(1)
 		sem <- struct{}{}
+		wg.Add(1)
 		go func(entry *cache.Entry) {
 			defer wg.Done()
 			defer func() { <-sem }()
