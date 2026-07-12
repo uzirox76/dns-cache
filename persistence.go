@@ -136,6 +136,38 @@ func (p *Persistence) SaveEntry(e *cache.Entry) error {
 	return err
 }
 
+func (p *Persistence) SaveBatch(entries []*cache.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := p.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, e := range entries {
+		data, err := e.Response.Pack()
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(e.QuestionName, e.QuestionType, data, e.StoredAt.Unix(), e.OriginalTTL, int64(e.CachedTTL.Seconds()), e.HitCount); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 func (p *Persistence) DeleteEntry(qname string, qtype uint16) error {
 	_, err := p.db.Exec(`DELETE FROM cache_entries WHERE question_name = ? AND question_type = ?`, qname, qtype)
 	return err

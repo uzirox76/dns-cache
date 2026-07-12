@@ -191,18 +191,20 @@ func persistLoop(c *cache.Cache, p *Persistence, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			snapshot := c.Snapshot()
-			var saved int
-			for _, e := range snapshot {
+			var batch []*cache.Entry
+			c.ForEach(func(_ string, e *cache.Entry) bool {
 				if e.HitCount > 0 {
-					if err := p.SaveEntry(e); err != nil {
-						log.Printf("[persist] save error: %v", err)
-					}
-					saved++
+					batch = append(batch, e)
 				}
+				return true
+			})
+			if len(batch) == 0 {
+				continue
 			}
-			if saved > 0 {
-				log.Printf("[persist] saved %d entries", saved)
+			if err := p.SaveBatch(batch); err != nil {
+				log.Printf("[persist] batch save error: %v", err)
+			} else {
+				log.Printf("[persist] saved %d entries", len(batch))
 			}
 		}
 	}

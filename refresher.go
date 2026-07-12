@@ -73,15 +73,16 @@ func (rf *Refresher) refreshCycle() {
 		return
 	}
 
+	now := time.Now()
 	var toRefresh []*cache.Entry
 
 	for _, e := range snapshot {
-		if e.IsExpired() {
+		if now.After(e.ExpiresAt) {
 			toRefresh = append(toRefresh, e)
 			continue
 		}
 
-		remaining := e.TTLRemaining()
+		remaining := e.ExpiresAt.Sub(now)
 		if remaining <= 0 {
 			toRefresh = append(toRefresh, e)
 			continue
