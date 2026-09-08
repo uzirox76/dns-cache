@@ -41,6 +41,10 @@ func (r *Resolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, string,
 	// Non si tocca il messaggio del client: l'OPT serve a noi verso l'upstream,
 	// e piu' avanti l'handler deve poter sapere se il client usava EDNS0.
 	out := msg.Copy()
+	// Il client puo' aver mandato un OPT suo e SetEdns0 appende senza
+	// sostituire: due OPT nella stessa query violano la RFC 6891 e c'e'
+	// chi risponde FORMERR.
+	out.Extra = stripOPT(out.Extra)
 	out.SetEdns0(dns.DefaultMsgSize, true)
 
 	// rand.Perm globale: e' safe per uso concorrente, un *rand.Rand per-istanza
