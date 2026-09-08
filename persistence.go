@@ -117,7 +117,7 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			CachedTTL:    cd,
 			ExpiresAt:    expiresAt,
 			HitCount:     hitCount,
-			LastHitAt:    storedTime,
+			LastHitAt:    storedTime.UnixNano(),
 		})
 	}
 	return entries, rows.Err()
@@ -180,8 +180,5 @@ func (p *Persistence) Cleanup(after time.Duration) (int, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	if n > 0 {
-		log.Printf("[cleanup] removed %d old entries from db", n)
-	}
 	return int(n), nil
 }

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -16,11 +17,15 @@ type Entry struct {
 	CachedTTL    time.Duration
 	ExpiresAt    time.Time
 	HitCount     uint64
-	LastHitAt    time.Time
+	LastHitAt    int64 // unix nano, atomica
 }
 
 func (e *Entry) IsExpired() bool {
 	return time.Now().After(e.ExpiresAt)
+}
+
+func (e *Entry) IsExpiredAt(now time.Time) bool {
+	return now.After(e.ExpiresAt)
 }
 
 func (e *Entry) TTLRemaining() time.Duration {
@@ -32,20 +37,24 @@ func (e *Entry) Key() string {
 }
 
 func (e *Entry) RefreshThreshold() float64 {
+	hc := atomic.LoadUint64(&e.HitCount)
 	switch {
-	case e.HitCount >= 100:
+	case hc >= 100:
 		return 0.30
-	case e.HitCount >= 20:
+	case hc >= 20:
 		return 0.20
-	case e.HitCount >= 5:
+	case hc >= 5:
 		return 0.15
 	default:
 		return 0.10
 	}
 }
 
+// Key normalizza il nome: i nomi DNS sono case-insensitive, quindi senza
+// canonicalizzare "Google.com." e "google.com." sarebbero due entry distinte
+// (e un client con 0x20 randomization manderebbe l'hit ratio a zero).
 func Key(name string, qtype uint16) string {
-	return fmt.Sprintf("%s:%d", dns.Fqdn(name), qtype)
+	return fmt.Sprintf("%s:%d", dns.CanonicalName(name), qtype)
 }
 
 func CopyAndSetTTL(msg *dns.Msg, ttl uint32) *dns.Msg {

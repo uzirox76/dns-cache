@@ -3,6 +3,7 @@ package stats
 import (
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"dns-cache/cache"
@@ -48,7 +49,7 @@ func BuildSnapshot(store Store, startedAt time.Time) StatsSnapshot {
 		top = append(top, DomainStat{
 			Name:     e.QuestionName,
 			Type:     name,
-			HitCount: e.HitCount,
+			HitCount: atomic.LoadUint64(&e.HitCount),
 			TTL:      int(e.TTLRemaining().Seconds()),
 		})
 		return true

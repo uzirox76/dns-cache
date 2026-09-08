@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -150,22 +151,32 @@ func runServer(configPath string) {
 		}
 	}
 
-	server := &dns.Server{
+	// Serve anche il TCP: un client che riceve una risposta troncata (TC=1)
+	// ritenta in TCP, e senza listener troverebbe la porta chiusa.
+	udpSrv := &dns.Server{
 		Addr:    cfg.Listen,
 		Net:     "udp",
 		Handler: handler,
-		UDPSize: 1232,
+		UDPSize: maxUDPSize,
+	}
+	tcpSrv := &dns.Server{
+		Addr:    cfg.Listen,
+		Net:     "tcp",
+		Handler: handler,
 	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
-		errCh <- server.ListenAndServe()
+		errCh <- udpSrv.ListenAndServe()
+	}()
+	go func() {
+		errCh <- tcpSrv.ListenAndServe()
 	}()
 
-	log.Printf("[ready] dns-cache listening on %s", cfg.Listen)
+	log.Printf("[ready] dns-cache listening on %s (udp+tcp)", cfg.Listen)
 
 	select {
 	case err := <-errCh:
@@ -176,14 +187,15 @@ func runServer(configPath string) {
 		log.Print("[shutdown] signal received, stopping...")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		server.ShutdownContext(ctx)
+		udpSrv.ShutdownContext(ctx)
+		tcpSrv.ShutdownContext(ctx)
 	}
 
 	log.Print("[shutdown] server stopped")
 }
 
 func persistLoop(c *cache.Cache, p *Persistence, stop <-chan struct{}) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -193,7 +205,7 @@ func persistLoop(c *cache.Cache, p *Persistence, stop <-chan struct{}) {
 		case <-ticker.C:
 			var batch []*cache.Entry
 			c.ForEach(func(_ string, e *cache.Entry) bool {
-				if e.HitCount > 0 {
+				if atomic.LoadUint64(&e.HitCount) > 0 {
 					batch = append(batch, e)
 				}
 				return true
@@ -202,9 +214,7 @@ func persistLoop(c *cache.Cache, p *Persistence, stop <-chan struct{}) {
 				continue
 			}
 			if err := p.SaveBatch(batch); err != nil {
-				log.Printf("[persist] batch save error: %v", err)
-			} else {
-				log.Printf("[persist] saved %d entries", len(batch))
+				log.Printf("[persist] batch error: %v", err)
 			}
 		}
 	}

@@ -5,12 +5,16 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 
 	"dns-cache/cache"
 )
+
+// maxRefreshPerCycle limita il lavoro di un singolo ciclo di refresh.
+const maxRefreshPerCycle = 500
 
 type Refresher struct {
 	cache    *cache.Cache
@@ -48,7 +52,6 @@ func (rf *Refresher) Stop() {
 	case <-done:
 		log.Print("[refresher] stopped")
 	case <-time.After(6 * time.Second):
-		log.Print("[refresher] stop: timeout, abandoning workers")
 	}
 }
 
@@ -77,7 +80,7 @@ func (rf *Refresher) refreshCycle() {
 	var toRefresh []*cache.Entry
 
 	for _, e := range snapshot {
-		if now.After(e.ExpiresAt) {
+		if e.IsExpiredAt(now) {
 			toRefresh = append(toRefresh, e)
 			continue
 		}
@@ -102,24 +105,26 @@ func (rf *Refresher) refreshCycle() {
 		return
 	}
 
-	// ponytail: cap altrimenti Stop() aspetta tutto
-	if len(toRefresh) > 500 {
-		toRefresh = toRefresh[:500]
-	}
-
+	// Ordinare prima di tagliare: al contrario il cap scarterebbe entry
+	// scelte a caso (l'ordine di iterazione della mappa) proprio quando la
+	// priorita' serve.
 	sort.Slice(toRefresh, func(i, j int) bool {
-		ie := toRefresh[i].IsExpired()
-		je := toRefresh[j].IsExpired()
+		ie := toRefresh[i].IsExpiredAt(now)
+		je := toRefresh[j].IsExpiredAt(now)
 		if ie != je {
 			return ie
 		}
-		return toRefresh[i].HitCount > toRefresh[j].HitCount
+		return atomic.LoadUint64(&toRefresh[i].HitCount) > atomic.LoadUint64(&toRefresh[j].HitCount)
 	})
+
+	if len(toRefresh) > maxRefreshPerCycle {
+		toRefresh = toRefresh[:maxRefreshPerCycle]
+	}
 
 	log.Printf("[refresher] refreshing %d/%d entries (top: %s %d hits)",
 		len(toRefresh), len(snapshot),
 		dns.TypeToString[toRefresh[0].QuestionType]+" "+toRefresh[0].QuestionName,
-		toRefresh[0].HitCount)
+		atomic.LoadUint64(&toRefresh[0].HitCount))
 
 	sem := make(chan struct{}, 5)
 	var wg sync.WaitGroup
@@ -179,7 +184,7 @@ func (rf *Refresher) pruneExpired() {
 	snapshot := rf.cache.Snapshot()
 	now := time.Now()
 	for _, e := range snapshot {
-		if e.IsExpired() && now.After(e.ExpiresAt.Add(24*time.Hour)) {
+		if e.IsExpiredAt(now) && now.After(e.ExpiresAt.Add(24*time.Hour)) {
 			rf.cache.Delete(e.Key())
 		}
 	}

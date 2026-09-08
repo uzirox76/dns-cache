@@ -3,11 +3,17 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 
 	"github.com/miekg/dns"
 
 	"dns-cache/cache"
 )
+
+// maxUDPSize e' il limite UDP annunciato e rispettato dal server: 1232 byte
+// stanno sotto la MTU tipica e non fanno frammentare il datagramma
+// (raccomandazione DNS Flag Day 2020).
+const maxUDPSize = 1232
 
 type DNSHandler struct {
 	cache    *cache.Cache
@@ -29,10 +35,7 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	key := cache.Key(q.Name, q.Qtype)
 
 	if entry, ok := h.cache.Get(key); ok {
-		resp := cache.CopyAndSetTTL(entry.Response, ttlForEntry(entry))
-		resp.SetReply(req)
-		resp.Compress = true
-		w.WriteMsg(resp)
+		respond(w, req, cache.CopyAndSetTTL(entry.Response, ttlForEntry(entry)))
 		return
 	}
 
@@ -43,10 +46,7 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 		if entry, ok := h.cache.GetStale(key); ok {
 			log.Printf("[stale] serving stale for %s (upstream error)", q.Name)
-			resp := cache.CopyAndSetTTL(entry.Response, 30)
-			resp.SetReply(req)
-			resp.Compress = true
-			w.WriteMsg(resp)
+			respond(w, req, cache.CopyAndSetTTL(entry.Response, 30))
 			return
 		}
 
@@ -65,11 +65,72 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		originalTTL = resp.Answer[0].Header().Ttl
 	}
 
-	h.cache.Set(q.Name, q.Qtype, resp, originalTTL)
+	if isCacheable(resp) {
+		h.cache.Set(q.Name, q.Qtype, resp, originalTTL)
+	}
 
+	respond(w, req, resp)
+}
+
+// isCacheable: si cachano solo NOERROR e NXDOMAIN (RFC 2308). SERVFAIL e
+// REFUSED sono guasti transitori dell'upstream e tenerli per ttl_min
+// significherebbe propagare per un minuto un problema non nostro. Una risposta
+// troncata e' incompleta e non va cachata in nessun caso.
+func isCacheable(resp *dns.Msg) bool {
+	if resp.Truncated {
+		return false
+	}
+	return resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError
+}
+
+// respond adatta una risposta gia' formata (dall'upstream o dalla cache) alla
+// domanda del client e la scrive, troncandola se il client non puo' riceverla
+// intera.
+func respond(w dns.ResponseWriter, req, resp *dns.Msg) {
+	// SetReply da solo non basta: forza l'Rcode a NOERROR e trasformerebbe
+	// gli NXDOMAIN in risposte vuote.
+	rcode := resp.Rcode
 	resp.SetReply(req)
+	resp.Rcode = rcode
+
+	// L'OPT presente descrive la sessione con l'upstream, non quella col
+	// client: si rimuove e, se il client usa EDNS0, se ne rimette uno suo.
+	if resp.IsEdns0() != nil {
+		resp.Extra = stripOPT(resp.Extra)
+	}
+
+	size := dns.MinMsgSize
+	if opt := req.IsEdns0(); opt != nil {
+		if s := int(opt.UDPSize()); s > size {
+			size = s
+		}
+		if size > maxUDPSize {
+			size = maxUDPSize
+		}
+		resp.SetEdns0(uint16(size), opt.Do())
+	}
+
+	// Su TCP non serve troncare: c'e' il campo lunghezza a 16 bit.
+	if _, isTCP := w.RemoteAddr().(*net.TCPAddr); isTCP {
+		size = dns.MaxMsgSize
+	}
+
 	resp.Compress = true
-	w.WriteMsg(resp)
+	resp.Truncate(size)
+
+	if err := w.WriteMsg(resp); err != nil {
+		log.Printf("[error] write reply %s: %v", req.Question[0].Name, err)
+	}
+}
+
+func stripOPT(rrs []dns.RR) []dns.RR {
+	out := make([]dns.RR, 0, len(rrs))
+	for _, rr := range rrs {
+		if rr.Header().Rrtype != dns.TypeOPT {
+			out = append(out, rr)
+		}
+	}
+	return out
 }
 
 func ttlForEntry(entry *cache.Entry) uint32 {

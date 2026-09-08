@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -30,21 +32,22 @@ type Config struct {
 type Cache struct {
 	mu      sync.RWMutex
 	entries map[string]*Entry
-	hits    uint64
-	misses  uint64
-	stale   uint64
-	errs    uint64
 	config  Config
 
+	hits         uint64
+	misses       uint64
+	staleServes  uint64
+	errs         uint64
 	totalQueries uint64
-	qpsRing      [60]int
-	qpsBase      int64
+	qpsCount     uint64
+	qpsBase      time.Time
 }
 
 func New(cfg Config) *Cache {
 	return &Cache{
 		entries: make(map[string]*Entry),
 		config:  cfg,
+		qpsBase: time.Now(),
 	}
 }
 
@@ -53,43 +56,37 @@ func (c *Cache) Get(key string) (*Entry, bool) {
 	e, ok := c.entries[key]
 	c.mu.RUnlock()
 
-	if !ok {
-		c.mu.Lock()
-		c.misses++
-		c.mu.Unlock()
+	// Una entry scaduta e' un miss: si rinterroga l'upstream. Lo stale
+	// serving vale solo quando l'upstream fallisce, via GetStale (RFC 8767).
+	if !ok || e.IsExpired() {
+		atomic.AddUint64(&c.misses, 1)
 		return nil, false
 	}
 
-	if e.IsExpired() {
-		if !c.config.StaleServing {
-			c.mu.Lock()
-			c.misses++
-			c.mu.Unlock()
-			return nil, false
-		}
-		c.mu.Lock()
-		e.HitCount++
-		e.LastHitAt = time.Now()
-		c.stale++
-		c.mu.Unlock()
-		return e, true
-	}
-
-	c.mu.Lock()
-	e.HitCount++
-	e.LastHitAt = time.Now()
-	c.hits++
-	c.mu.Unlock()
+	atomic.AddUint64(&e.HitCount, 1)
+	atomic.StoreInt64(&e.LastHitAt, time.Now().UnixNano())
+	atomic.AddUint64(&c.hits, 1)
 	return e, true
 }
 
+// GetStale ritorna una entry scaduta da servire quando tutti gli upstream
+// hanno fallito (RFC 8767). Ritorna false se lo stale serving e' disattivato.
 func (c *Cache) GetStale(key string) (*Entry, bool) {
+	if !c.config.StaleServing {
+		return nil, false
+	}
+
 	c.mu.RLock()
 	e, ok := c.entries[key]
 	c.mu.RUnlock()
+
 	if !ok {
 		return nil, false
 	}
+
+	atomic.AddUint64(&e.HitCount, 1)
+	atomic.StoreInt64(&e.LastHitAt, time.Now().UnixNano())
+	atomic.AddUint64(&c.staleServes, 1)
 	return e, true
 }
 
@@ -116,7 +113,7 @@ func (c *Cache) Set(qname string, qtype uint16, resp *dns.Msg, originalTTL uint3
 
 	now := time.Now()
 	e := &Entry{
-		QuestionName: qname,
+		QuestionName: dns.CanonicalName(qname),
 		QuestionType: qtype,
 		Response:     resp.Copy(),
 		StoredAt:     now,
@@ -124,7 +121,7 @@ func (c *Cache) Set(qname string, qtype uint16, resp *dns.Msg, originalTTL uint3
 		CachedTTL:    ttl,
 		ExpiresAt:    now.Add(ttl),
 		HitCount:     1,
-		LastHitAt:    now,
+		LastHitAt:    now.UnixNano(),
 	}
 
 	c.mu.Lock()
@@ -136,17 +133,26 @@ func (c *Cache) Set(qname string, qtype uint16, resp *dns.Msg, originalTTL uint3
 }
 
 func (c *Cache) evictOne() {
-	var oldestKey string
-	var oldest time.Time
+	const sampleSize = 8
 	now := time.Now()
+	n := len(c.entries)
+	var oldestKey string
+	var oldest int64 = math.MaxInt64
+	count := 0
+
 	for k, v := range c.entries {
-		if v.IsExpired() && now.After(v.ExpiresAt.Add(24*time.Hour)) {
+		if now.After(v.ExpiresAt) && now.After(v.ExpiresAt.Add(24*time.Hour)) {
 			delete(c.entries, k)
 			return
 		}
-		if oldestKey == "" || v.LastHitAt.Before(oldest) {
+		lha := atomic.LoadInt64(&v.LastHitAt)
+		if lha < oldest {
+			oldest = lha
 			oldestKey = k
-			oldest = v.LastHitAt
+		}
+		count++
+		if count >= sampleSize || count >= n {
+			break
 		}
 	}
 	if oldestKey != "" {
@@ -179,8 +185,7 @@ func (c *Cache) Snapshot() map[string]*Entry {
 	defer c.mu.RUnlock()
 	m := make(map[string]*Entry, len(c.entries))
 	for k, v := range c.entries {
-		vc := *v
-		m[k] = &vc
+		m[k] = v
 	}
 	return m
 }
@@ -192,87 +197,45 @@ func (c *Cache) LoadEntry(e *Entry) {
 }
 
 func (c *Cache) Stats() Stats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	hits := atomic.LoadUint64(&c.hits)
+	misses := atomic.LoadUint64(&c.misses)
+
 	var ratio float64
-	total := c.hits + c.misses
+	total := hits + misses
 	if total > 0 {
-		ratio = float64(c.hits) / float64(total) * 100
+		ratio = float64(hits) / float64(total) * 100
 	}
 
-	var sum int
-	for _, v := range c.qpsRing {
-		sum += v
-	}
+	qps := atomic.LoadUint64(&c.qpsCount)
+	elapsed := time.Since(c.qpsBase).Seconds()
 	var avgQPS float64
-	window := 60
-	if c.qpsBase > 0 {
-		elapsed := time.Now().Unix() - c.qpsBase
-		if elapsed > 0 && int(elapsed) < window {
-			window = int(elapsed)
-		}
-	}
-	if window > 0 {
-		avgQPS = float64(sum) / float64(window)
+	if elapsed > 0 {
+		avgQPS = float64(qps) / elapsed
 	}
 
-	qpsHist := make([]int, len(c.qpsRing))
-	copy(qpsHist, c.qpsRing[:])
+	c.mu.RLock()
+	n := len(c.entries)
+	c.mu.RUnlock()
 
 	return Stats{
-		Entries:      len(c.entries),
+		Entries:      n,
 		MaxEntries:   c.config.MaxEntries,
-		Hits:         c.hits,
-		Misses:       c.misses,
-		StaleServes:  c.stale,
-		Errors:       c.errs,
+		Hits:         hits,
+		Misses:       misses,
+		StaleServes:  atomic.LoadUint64(&c.staleServes),
+		Errors:       atomic.LoadUint64(&c.errs),
 		HitRatio:     ratio,
-		TotalQueries: c.totalQueries,
-		QPSHistory:   qpsHist,
+		TotalQueries: atomic.LoadUint64(&c.totalQueries),
+		QPSHistory:   nil,
 		AvgQPS:       avgQPS,
 	}
 }
 
 func (c *Cache) IncrQueries() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.trackQPS()
-}
-
-func (c *Cache) trackQPS() {
-	now := time.Now().Unix()
-	c.totalQueries++
-
-	if c.qpsBase == 0 {
-		c.qpsBase = now
-	}
-
-	sec := int(now - c.qpsBase)
-	if sec >= 60 {
-		shift := sec - 59
-		if shift >= 60 {
-			c.qpsBase = now
-			c.qpsRing = [60]int{}
-			c.qpsRing[0] = 1
-			return
-		}
-		copy(c.qpsRing[:], c.qpsRing[shift:])
-		for i := 60 - shift; i < 60; i++ {
-			c.qpsRing[i] = 0
-		}
-		c.qpsBase += int64(shift)
-		sec = 59
-	} else if sec < 0 {
-		c.qpsBase = now
-		c.qpsRing = [60]int{}
-		c.qpsRing[0] = 1
-		return
-	}
-	c.qpsRing[sec]++
+	atomic.AddUint64(&c.totalQueries, 1)
+	atomic.AddUint64(&c.qpsCount, 1)
 }
 
 func (c *Cache) IncrErrors() {
-	c.mu.Lock()
-	c.errs++
-	c.mu.Unlock()
+	atomic.AddUint64(&c.errs, 1)
 }
