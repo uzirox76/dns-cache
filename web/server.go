@@ -200,6 +200,7 @@ var tmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
     font-size: 0.875rem;
   }
   .hit { color: #4ade80; }
+  .sub { font-size: 12px; color: #64748b; margin-top: 4px; }
   .ttl { color: #94a3b8; font-size: 0.75rem; }
   .dist { margin-bottom: 1.5rem; }
   .dist-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem; font-size: 0.8125rem; }
@@ -220,16 +221,23 @@ var tmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
     <div class="bar-bg"><div class="bar-fill" style="width:{{printf "%.0f" (percent .Cache.Entries .Cache.MaxEntries)}}%;background:#38bdf8"></div></div>
   </div>
   <div class="card">
-    <div class="label">Hit ratio</div>
+    <div class="label">Hit ratio ({{.Cache.WindowMinutes}} min)</div>
+    {{if .Cache.WindowQueries}}
+    <div class="value green">{{printf "%.1f" .Cache.HitRatioWindow}}%</div>
+    <div class="sub">su {{.Cache.WindowQueries}} query</div>
+    {{else}}
+    <div class="value green">&mdash;</div>
+    <div class="sub">nessuna query</div>
+    {{end}}
+  </div>
+  <div class="card">
+    <div class="label">Hit ratio (dall'avvio)</div>
     <div class="value green">{{printf "%.1f" .Cache.HitRatio}}%</div>
+    <div class="sub">su {{.Cache.TotalQueries}} query</div>
   </div>
   <div class="card">
-    <div class="label">QPS (media 60s)</div>
+    <div class="label">QPS (media dall'avvio)</div>
     <div class="value cyan">{{printf "%.1f" .Cache.AvgQPS}}</div>
-  </div>
-  <div class="card">
-    <div class="label">Query totali</div>
-    <div class="value blue">{{.Cache.TotalQueries}}</div>
   </div>
   <div class="card">
     <div class="label">Hits</div>

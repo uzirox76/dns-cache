@@ -15,7 +15,7 @@ gofmt -l .
 sudo make install             # binary + /etc/dns-cache.yaml + systemd unit; runs daemon-reload
 ```
 
-There are **no test files in the repo** — `go test ./...` is currently a no-op. If you add tests, `go test ./cache -run TestName -v` for a single one.
+Tests live in `cache/cache_test.go` (sliding stats window, `Set()` hit-count inheritance). `go test ./...`, or `go test ./cache -run TestName -v` for a single one.
 
 ### Running locally
 
@@ -58,11 +58,11 @@ Package layout is a deliberate one-way dependency: `cache/`, `stats/`, and `web/
 
 - **`persistLoop`** (main.go, 30s): `ForEach` collects entries with `HitCount > 0` and writes them in one `SaveBatch` transaction. This is the only writer — nothing is flushed at shutdown, so up to 30s of entries can be lost. Shutdown order matters: `close(persistStop)` → `persistWg.Wait()` → `p.Close()`, so the goroutine never touches a closed DB (a past bug).
 - **`cleanupLoop`** (hourly): deletes rows older than `cleanup_after_hours`.
-- **`Refresher`** (`refresher.go`, `refresh_interval`): predictive prefetch. `Entry.RefreshThreshold()` returns 10–30% of TTL scaled by hit count, so hot domains refresh earlier. Each cycle is bounded at 500 entries with 5 concurrent resolves, sorted expired-first then by hit count. A non-`NOERROR` upstream reply keeps the old entry rather than poisoning the cache. With stale serving on, it prunes entries expired more than 24h.
+- **`Refresher`** (`refresher.go`, `refresh_interval`): predictive prefetch. `Entry.RefreshThreshold()` returns 10–30% of TTL scaled by hit count, so hot domains refresh earlier. Candidates are gated on recency: only entries a client asked for in the last hour (`refreshMaxIdle`), because a refresh keeps an entry alive forever and without the gate nothing ever leaves the cache on its own. The refresh window is `max(pct*TTL, refresh_interval*1.5)` — a window narrower than the tick means the entry expires before the prefetch ever fires. Each cycle is bounded at 500 entries with 5 concurrent resolves, sorted expired-first then by hit count. Entries that fail a refresh get exponential backoff (state lives in the Refresher, not the Entry). A non-`NOERROR` upstream reply keeps the old entry rather than poisoning the cache. With stale serving on, it prunes entries expired more than 24h.
 
 ### Persistence (`persistence.go`)
 
-SQLite via `modernc.org/sqlite` (pure Go, no cgo — keeps the binary static). WAL + `synchronous=NORMAL`, and `MaxOpenConns(1)` because the driver plus a single-writer workload makes a connection pool pointless. Responses are stored as packed wire-format blobs; `LoadAll()` reconstructs `ExpiresAt` as `stored_at + original_ttl`, so restored entries are frequently already expired and get picked up by the refresher on its first cycle.
+SQLite via `modernc.org/sqlite` (pure Go, no cgo — keeps the binary static). WAL + `synchronous=NORMAL`, and `MaxOpenConns(1)` because the driver plus a single-writer workload makes a connection pool pointless. Responses are stored as packed wire-format blobs. `LoadAll()` reconstructs `ExpiresAt` from `cached_ttl` (the TTL the cache actually applied after clamping, not the upstream's) and **skips entries already expired** — reloading them just filled the cache and the refresher queue with rows that need re-resolving anyway. `last_hit_at` is persisted too: without it the recency gate reads the last *refresh* time and never filters anything after a restart. Columns are added to existing DBs via `addColumnIfMissing`, since `CREATE TABLE IF NOT EXISTS` won't touch an existing table.
 
 ### Config (`config.go`)
 

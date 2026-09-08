@@ -10,16 +10,35 @@ import (
 )
 
 type Stats struct {
-	Entries      int     `json:"entries"`
-	MaxEntries   int     `json:"max_entries"`
-	Hits         uint64  `json:"hits"`
-	Misses       uint64  `json:"misses"`
-	StaleServes  uint64  `json:"stale_serves"`
-	Errors       uint64  `json:"errors"`
-	HitRatio     float64 `json:"hit_ratio"`
-	TotalQueries uint64  `json:"total_queries"`
-	QPSHistory   []int   `json:"qps_history"`
-	AvgQPS       float64 `json:"avg_qps"`
+	Entries     int     `json:"entries"`
+	MaxEntries  int     `json:"max_entries"`
+	Hits        uint64  `json:"hits"`
+	Misses      uint64  `json:"misses"`
+	StaleServes uint64  `json:"stale_serves"`
+	Errors      uint64  `json:"errors"`
+	HitRatio    float64 `json:"hit_ratio"`
+	// Rapporto sulla finestra scorrevole: HitRatio e' cumulativo dall'avvio,
+	// quindi dopo un riavvio resta per un pezzo dominato dal cold start e non
+	// dice mai come sta andando adesso.
+	HitRatioWindow float64 `json:"hit_ratio_window"`
+	WindowQueries  uint64  `json:"window_queries"`
+	WindowMinutes  int     `json:"window_minutes"`
+	TotalQueries   uint64  `json:"total_queries"`
+	QPSHistory     []int   `json:"qps_history"`
+	AvgQPS         float64 `json:"avg_qps"`
+}
+
+// windowMinutes e' l'ampiezza della finestra scorrevole, un bucket al
+// minuto: 15 bucket da 24 byte, e per query un modulo e due atomiche.
+const windowMinutes = 15
+
+// windowBucket accumula gli esiti di un singolo minuto. minute e' l'indice
+// del minuto a cui appartiene: quando non corrisponde il bucket e' vecchio e
+// va riusato.
+type windowBucket struct {
+	minute int64
+	hits   uint64
+	misses uint64
 }
 
 type Config struct {
@@ -41,6 +60,8 @@ type Cache struct {
 	totalQueries uint64
 	qpsCount     uint64
 	qpsBase      time.Time
+
+	window [windowMinutes]windowBucket
 }
 
 func New(cfg Config) *Cache {
@@ -69,12 +90,14 @@ func (c *Cache) Get(key string) (*Entry, bool) {
 			atomic.StoreInt64(&e.LastHitAt, time.Now().UnixNano())
 		}
 		atomic.AddUint64(&c.misses, 1)
+		c.recordWindow(false)
 		return nil, false
 	}
 
 	atomic.AddUint64(&e.HitCount, 1)
 	atomic.StoreInt64(&e.LastHitAt, time.Now().UnixNano())
 	atomic.AddUint64(&c.hits, 1)
+	c.recordWindow(true)
 	return e, true
 }
 
@@ -217,6 +240,43 @@ func (c *Cache) LoadEntry(e *Entry) {
 	c.mu.Unlock()
 }
 
+// recordWindow segna l'esito nel bucket del minuto corrente.
+func (c *Cache) recordWindow(hit bool) {
+	minute := time.Now().Unix() / 60
+	b := &c.window[minute%windowMinutes]
+
+	// Bucket di un minuto vecchio: va riusato. La CAS fa vincere un solo
+	// chiamante, gli altri vedono gia' il minuto nuovo e passano a contare.
+	// Nella finestra fra la CAS e gli Store si puo' perdere qualche conteggio
+	// di chi stava scrivendo sul bucket vecchio: e' un contatore da cruscotto,
+	// non una statistica contabile.
+	if got := atomic.LoadInt64(&b.minute); got != minute {
+		if atomic.CompareAndSwapInt64(&b.minute, got, minute) {
+			atomic.StoreUint64(&b.hits, 0)
+			atomic.StoreUint64(&b.misses, 0)
+		}
+	}
+
+	if hit {
+		atomic.AddUint64(&b.hits, 1)
+	} else {
+		atomic.AddUint64(&b.misses, 1)
+	}
+}
+
+// windowStats somma i bucket che ricadono nella finestra.
+func (c *Cache) windowStats() (hits, misses uint64) {
+	cutoff := time.Now().Unix()/60 - windowMinutes
+	for i := range c.window {
+		b := &c.window[i]
+		if atomic.LoadInt64(&b.minute) > cutoff {
+			hits += atomic.LoadUint64(&b.hits)
+			misses += atomic.LoadUint64(&b.misses)
+		}
+	}
+	return hits, misses
+}
+
 func (c *Cache) Stats() Stats {
 	hits := atomic.LoadUint64(&c.hits)
 	misses := atomic.LoadUint64(&c.misses)
@@ -234,21 +294,30 @@ func (c *Cache) Stats() Stats {
 		avgQPS = float64(qps) / elapsed
 	}
 
+	wHits, wMisses := c.windowStats()
+	var wRatio float64
+	if wTotal := wHits + wMisses; wTotal > 0 {
+		wRatio = float64(wHits) / float64(wTotal) * 100
+	}
+
 	c.mu.RLock()
 	n := len(c.entries)
 	c.mu.RUnlock()
 
 	return Stats{
-		Entries:      n,
-		MaxEntries:   c.config.MaxEntries,
-		Hits:         hits,
-		Misses:       misses,
-		StaleServes:  atomic.LoadUint64(&c.staleServes),
-		Errors:       atomic.LoadUint64(&c.errs),
-		HitRatio:     ratio,
-		TotalQueries: atomic.LoadUint64(&c.totalQueries),
-		QPSHistory:   nil,
-		AvgQPS:       avgQPS,
+		Entries:        n,
+		MaxEntries:     c.config.MaxEntries,
+		Hits:           hits,
+		Misses:         misses,
+		StaleServes:    atomic.LoadUint64(&c.staleServes),
+		Errors:         atomic.LoadUint64(&c.errs),
+		HitRatio:       ratio,
+		HitRatioWindow: wRatio,
+		WindowQueries:  wHits + wMisses,
+		WindowMinutes:  windowMinutes,
+		TotalQueries:   atomic.LoadUint64(&c.totalQueries),
+		QPSHistory:     nil,
+		AvgQPS:         avgQPS,
 	}
 }
 
