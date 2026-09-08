@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -50,13 +51,51 @@ func NewPersistence(dbPath string) (*Persistence, error) {
 			original_ttl   INTEGER NOT NULL,
 			cached_ttl     INTEGER NOT NULL DEFAULT 0,
 			hit_count      INTEGER DEFAULT 0,
+			last_hit_at    INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (question_name, question_type)
 		)
 	`); err != nil {
 		return nil, err
 	}
 
+	if err := addColumnIfMissing(db, "last_hit_at", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return nil, err
+	}
+
 	return &Persistence{db: db, dbPath: dbPath}, nil
+}
+
+// addColumnIfMissing aggiunge una colonna ai db gia' esistenti: CREATE TABLE
+// IF NOT EXISTS non tocca una tabella gia' creata da una versione precedente.
+func addColumnIfMissing(db *sql.DB, name, decl string) error {
+	rows, err := db.Query(`PRAGMA table_info(cache_entries)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			colName    string
+			colType    string
+			notNull    int
+			dfltValue  sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &colName, &colType, &notNull, &dfltValue, &primaryKey); err != nil {
+			return err
+		}
+		if colName == name {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`ALTER TABLE cache_entries ADD COLUMN ` + name + ` ` + decl)
+	return err
 }
 
 func dirOf(p string) string {
@@ -74,7 +113,7 @@ func (p *Persistence) Close() error {
 
 func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 	rows, err := p.db.Query(`
-		SELECT question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count
+		SELECT question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at
 		FROM cache_entries
 	`)
 	if err != nil {
@@ -95,8 +134,9 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			origTTL   uint32
 			cachedTTL int64
 			hitCount  uint64
+			lastHitAt int64
 		)
-		if err := rows.Scan(&qname, &qtype, &data, &storedAt, &origTTL, &cachedTTL, &hitCount); err != nil {
+		if err := rows.Scan(&qname, &qtype, &data, &storedAt, &origTTL, &cachedTTL, &hitCount, &lastHitAt); err != nil {
 			log.Printf("[warn] scan row: %v", err)
 			continue
 		}
@@ -124,6 +164,13 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			continue
 		}
 
+		// Righe scritte prima che la colonna esistesse: si ripiega su
+		// stored_at, che e' l'ora dell'ultimo refresh e non dell'ultima
+		// richiesta del client, ma e' il meglio che quelle righe sanno dire.
+		if lastHitAt == 0 {
+			lastHitAt = storedTime.UnixNano()
+		}
+
 		msg := new(dns.Msg)
 		if err := msg.Unpack(data); err != nil {
 			log.Printf("[warn] unpack cached msg: %v", err)
@@ -139,7 +186,7 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			CachedTTL:    cd,
 			ExpiresAt:    expiresAt,
 			HitCount:     hitCount,
-			LastHitAt:    storedTime.UnixNano(),
+			LastHitAt:    lastHitAt,
 		})
 	}
 
@@ -157,9 +204,10 @@ func (p *Persistence) SaveEntry(e *cache.Entry) error {
 	}
 
 	_, err = p.db.Exec(`
-		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, e.QuestionName, e.QuestionType, data, e.StoredAt.Unix(), e.OriginalTTL, int64(e.CachedTTL.Seconds()), e.HitCount)
+		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, e.QuestionName, e.QuestionType, data, e.StoredAt.Unix(), e.OriginalTTL, int64(e.CachedTTL.Seconds()),
+		atomic.LoadUint64(&e.HitCount), atomic.LoadInt64(&e.LastHitAt))
 	return err
 }
 
@@ -174,8 +222,8 @@ func (p *Persistence) SaveBatch(entries []*cache.Entry) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -187,7 +235,8 @@ func (p *Persistence) SaveBatch(entries []*cache.Entry) error {
 		if err != nil {
 			return err
 		}
-		if _, err := stmt.Exec(e.QuestionName, e.QuestionType, data, e.StoredAt.Unix(), e.OriginalTTL, int64(e.CachedTTL.Seconds()), e.HitCount); err != nil {
+		if _, err := stmt.Exec(e.QuestionName, e.QuestionType, data, e.StoredAt.Unix(), e.OriginalTTL, int64(e.CachedTTL.Seconds()),
+			atomic.LoadUint64(&e.HitCount), atomic.LoadInt64(&e.LastHitAt)); err != nil {
 			return err
 		}
 	}
