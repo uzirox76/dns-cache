@@ -59,6 +59,15 @@ func (c *Cache) Get(key string) (*Entry, bool) {
 	// Una entry scaduta e' un miss: si rinterroga l'upstream. Lo stale
 	// serving vale solo quando l'upstream fallisce, via GetStale (RFC 8767).
 	if !ok || e.IsExpired() {
+		// La entry c'era ma era scaduta: il client questo nome l'ha chiesto
+		// lo stesso, quindi si aggiorna la recency (non HitCount, che conta
+		// le risposte servite dalla cache). E' su LastHitAt che il refresher
+		// decide chi vale la pena tenere caldo: senza questo aggiornamento un
+		// dominio con TTL corto uscirebbe dal set caldo proprio perche'
+		// scade sempre prima del tick successivo.
+		if ok {
+			atomic.StoreInt64(&e.LastHitAt, time.Now().UnixNano())
+		}
 		atomic.AddUint64(&c.misses, 1)
 		return nil, false
 	}
@@ -124,11 +133,23 @@ func (c *Cache) Set(qname string, qtype uint16, resp *dns.Msg, originalTTL uint3
 		LastHitAt:    now.UnixNano(),
 	}
 
+	key := e.Key()
+
 	c.mu.Lock()
-	if len(c.entries) >= c.config.MaxEntries {
+	// Un refresh sostituisce la entry ma non e' un accesso del client: hit
+	// count e recency si ereditano da quella vecchia. Azzerandoli ogni
+	// refresh raffredderebbe il dominio, RefreshThreshold() tornerebbe al
+	// 10% proprio sulle entry piu' calde e LastHitAt segnerebbe l'ultimo
+	// refresh invece dell'ultima richiesta vera.
+	if old, replacing := c.entries[key]; replacing {
+		e.HitCount = atomic.LoadUint64(&old.HitCount)
+		e.LastHitAt = atomic.LoadInt64(&old.LastHitAt)
+	} else if len(c.entries) >= c.config.MaxEntries {
+		// Si sfratta solo quando la chiave e' nuova: sostituire una entry
+		// esistente non fa crescere la mappa.
 		c.evictOne()
 	}
-	c.entries[e.Key()] = e
+	c.entries[key] = e
 	c.mu.Unlock()
 }
 

@@ -83,6 +83,9 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 	defer rows.Close()
 
 	var entries []*cache.Entry
+	var skipped int
+	now := time.Now()
+
 	for rows.Next() {
 		var (
 			qname     string
@@ -98,15 +101,34 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			continue
 		}
 
+		storedTime := time.Unix(storedAt, 0)
+
+		// La scadenza si ricostruisce dal TTL effettivamente applicato dalla
+		// cache, non da quello dell'upstream: Set() lo clampa in
+		// [ttl_min, ttl_max] e ripartire da origTTL rimetterebbe in circolo
+		// entry con una vita diversa da quella che la config consente.
+		// cached_ttl e' DEFAULT 0, quindi le righe scritte prima che la
+		// colonna esistesse ricadono su origTTL.
+		cd := time.Duration(cachedTTL) * time.Second
+		if cd <= 0 {
+			cd = time.Duration(origTTL) * time.Second
+		}
+		expiresAt := storedTime.Add(cd)
+
+		// Le entry gia' scadute non si caricano. Riempirebbero la cache (e
+		// il tetto per ciclo del refresher) di roba che va comunque
+		// rinterrogata alla prima richiesta del client: dopo una notte a
+		// macchina spenta sono la maggioranza della tabella.
+		if now.After(expiresAt) {
+			skipped++
+			continue
+		}
+
 		msg := new(dns.Msg)
 		if err := msg.Unpack(data); err != nil {
 			log.Printf("[warn] unpack cached msg: %v", err)
 			continue
 		}
-
-		storedTime := time.Unix(storedAt, 0)
-		expiresAt := storedTime.Add(time.Duration(origTTL) * time.Second)
-		cd := time.Duration(cachedTTL) * time.Second
 
 		entries = append(entries, &cache.Entry{
 			QuestionName: qname,
@@ -120,6 +142,11 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			LastHitAt:    storedTime.UnixNano(),
 		})
 	}
+
+	if skipped > 0 {
+		log.Printf("[persist] skipped %d expired entries", skipped)
+	}
+
 	return entries, rows.Err()
 }
 
