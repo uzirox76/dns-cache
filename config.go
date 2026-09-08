@@ -8,12 +8,12 @@ import (
 )
 
 type Config struct {
-	Listen      string           `yaml:"listen"`
-	Upstreams   []string         `yaml:"upstreams"`
-	CacheCfg    CacheConfig      `yaml:"cache"`
-	PersistCfg  PersistenceConfig `yaml:"persistence"`
-	StatsCfg    StatsConfig      `yaml:"stats"`
-	WebCfg      WebConfig        `yaml:"web"`
+	Listen     string            `yaml:"listen"`
+	Upstreams  []string          `yaml:"upstreams"`
+	CacheCfg   CacheConfig       `yaml:"cache"`
+	PersistCfg PersistenceConfig `yaml:"persistence"`
+	StatsCfg   StatsConfig       `yaml:"stats"`
+	WebCfg     WebConfig         `yaml:"web"`
 }
 
 type CacheConfig struct {
@@ -25,8 +25,8 @@ type CacheConfig struct {
 }
 
 type PersistenceConfig struct {
-	DBPath        string `yaml:"db_path"`
-	CleanupAfter  int    `yaml:"cleanup_after_hours"`
+	DBPath       string `yaml:"db_path"`
+	CleanupAfter int    `yaml:"cleanup_after_hours"`
 }
 
 type StatsConfig struct {

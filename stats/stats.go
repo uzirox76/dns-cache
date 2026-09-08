@@ -91,5 +91,3 @@ func QtypeName(qtype uint16) string {
 	}
 	return fmt.Sprintf("TYPE%d", qtype)
 }
-
-
