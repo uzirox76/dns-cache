@@ -10,9 +10,12 @@ import (
 )
 
 type Stats struct {
-	Entries     int     `json:"entries"`
-	MaxEntries  int     `json:"max_entries"`
-	Hits        uint64  `json:"hits"`
+	Entries    int    `json:"entries"`
+	MaxEntries int    `json:"max_entries"`
+	Hits       uint64 `json:"hits"`
+	// LateHits e' la parte di Hits servita oltre il TTL (entro max_age),
+	// mentre l'handler rinfrescava la entry in background.
+	LateHits    uint64  `json:"late_hits"`
 	Misses      uint64  `json:"misses"`
 	StaleServes uint64  `json:"stale_serves"`
 	Errors      uint64  `json:"errors"`
@@ -41,11 +44,36 @@ type windowBucket struct {
 	misses uint64
 }
 
+// staleMaxAge limita lo stale serving quando l'upstream non risponde (la RFC
+// 8767 suggerisce da uno a tre giorni). Il limite va detto esplicitamente
+// perche' le entry scadute restano in cache per tutta la finestra dei giorni
+// d'uso.
+const staleMaxAge = 24 * time.Hour
+
 type Config struct {
 	TTLMin       time.Duration
 	TTLMax       time.Duration
 	MaxEntries   int
 	StaleServing bool
+	// MaxAge: oltre il TTL una entry si serve ancora finche' la risposta ha
+	// meno di MaxAge dal fetch, e intanto l'handler la rinfresca in
+	// background. 0 = mai oltre il TTL.
+	MaxAge time.Duration
+	// Domini abituali: chiesti in almeno KeepMinDays degli ultimi
+	// KeepWindowDays giorni. Sono quelli che il refresher tiene aggiornati.
+	KeepMinDays    int
+	KeepWindowDays int
+}
+
+// Usual dice se la entry e' di un dominio abituale.
+func (cfg Config) Usual(e *Entry, now time.Time) bool {
+	return e.DaysUsed(now, cfg.KeepWindowDays) >= cfg.KeepMinDays
+}
+
+// KeepWindow e' la finestra dei giorni d'uso come durata: per tanto va tenuto
+// lo storico di una entry, anche scaduta.
+func (cfg Config) KeepWindow() time.Duration {
+	return time.Duration(cfg.KeepWindowDays) * 24 * time.Hour
 }
 
 type Cache struct {
@@ -54,6 +82,7 @@ type Cache struct {
 	config  Config
 
 	hits         uint64
+	lateHits     uint64
 	misses       uint64
 	staleServes  uint64
 	errs         uint64
@@ -77,32 +106,45 @@ func (c *Cache) Get(key string) (*Entry, bool) {
 	e, ok := c.entries[key]
 	c.mu.RUnlock()
 
-	// Una entry scaduta e' un miss: si rinterroga l'upstream. Lo stale
-	// serving vale solo quando l'upstream fallisce, via GetStale (RFC 8767).
-	if !ok || e.IsExpired() {
-		// La entry c'era ma era scaduta: il client questo nome l'ha chiesto
-		// lo stesso, quindi si aggiorna la recency (non HitCount, che conta
-		// le risposte servite dalla cache). E' su LastHitAt che il refresher
-		// decide chi vale la pena tenere caldo: senza questo aggiornamento un
-		// dominio con TTL corto uscirebbe dal set caldo proprio perche'
-		// scade sempre prima del tick successivo.
-		if ok {
-			atomic.StoreInt64(&e.LastHitAt, time.Now().UnixNano())
-		}
+	if !ok {
+		atomic.AddUint64(&c.misses, 1)
+		c.recordWindow(false)
+		return nil, false
+	}
+
+	// Il client il nome l'ha chiesto, che la entry si possa servire o no:
+	// recency e giorni d'uso si aggiornano comunque (HitCount no, conta le
+	// risposte servite dalla cache). E' su questi che il refresher decide chi
+	// tenere aggiornato: se contassero solo gli hit, un dominio che si riapre
+	// dopo ore -- e che quindi finora era sempre un miss -- non diventerebbe
+	// mai abituale.
+	now := time.Now()
+	atomic.StoreInt64(&e.LastHitAt, now.UnixNano())
+	e.MarkUsed(now)
+
+	// Oltre il TTL la entry si serve solo finche' la risposta ha meno di
+	// MaxAge, e l'handler intanto la rinfresca. Piu' vecchia e' un miss: si
+	// rinterroga l'upstream. Lo stale serving vero e proprio vale solo quando
+	// l'upstream fallisce, via GetStale (RFC 8767).
+	expired := e.IsExpiredAt(now)
+	if expired && now.Sub(e.StoredAt) > c.config.MaxAge {
 		atomic.AddUint64(&c.misses, 1)
 		c.recordWindow(false)
 		return nil, false
 	}
 
 	atomic.AddUint64(&e.HitCount, 1)
-	atomic.StoreInt64(&e.LastHitAt, time.Now().UnixNano())
 	atomic.AddUint64(&c.hits, 1)
+	if expired {
+		atomic.AddUint64(&c.lateHits, 1)
+	}
 	c.recordWindow(true)
 	return e, true
 }
 
 // GetStale ritorna una entry scaduta da servire quando tutti gli upstream
-// hanno fallito (RFC 8767). Ritorna false se lo stale serving e' disattivato.
+// hanno fallito (RFC 8767). Ritorna false se lo stale serving e' disattivato
+// o se la entry e' scaduta da piu' di staleMaxAge.
 func (c *Cache) GetStale(key string) (*Entry, bool) {
 	if !c.config.StaleServing {
 		return nil, false
@@ -112,7 +154,7 @@ func (c *Cache) GetStale(key string) (*Entry, bool) {
 	e, ok := c.entries[key]
 	c.mu.RUnlock()
 
-	if !ok {
+	if !ok || time.Since(e.ExpiresAt) > staleMaxAge {
 		return nil, false
 	}
 
@@ -126,7 +168,11 @@ func (c *Cache) Set(qname string, qtype uint16, resp *dns.Msg, originalTTL uint3
 	if len(resp.Answer) == 0 {
 		for _, rr := range resp.Ns {
 			if soa, ok := rr.(*dns.SOA); ok {
-				originalTTL = soa.Minttl
+				// RFC 2308 §5: il TTL negativo e' il minimo fra il campo
+				// MINIMUM e il TTL del SOA stesso. Col solo MINIMUM i domini
+				// su Route53, che lo mette a 86400, restavano in cache un
+				// giorno: un record aggiunto nel frattempo non si vedeva.
+				originalTTL = min(soa.Minttl, soa.Hdr.Ttl)
 				break
 			}
 		}
@@ -154,19 +200,22 @@ func (c *Cache) Set(qname string, qtype uint16, resp *dns.Msg, originalTTL uint3
 		ExpiresAt:    now.Add(ttl),
 		HitCount:     1,
 		LastHitAt:    now.UnixNano(),
+		UsedDays:     PackUsedDays(now),
 	}
 
 	key := e.Key()
 
 	c.mu.Lock()
 	// Un refresh sostituisce la entry ma non e' un accesso del client: hit
-	// count e recency si ereditano da quella vecchia. Azzerandoli ogni
-	// refresh raffredderebbe il dominio, RefreshThreshold() tornerebbe al
-	// 10% proprio sulle entry piu' calde e LastHitAt segnerebbe l'ultimo
-	// refresh invece dell'ultima richiesta vera.
+	// count, recency e giorni d'uso si ereditano da quella vecchia. Azzerandoli
+	// ogni refresh raffredderebbe il dominio, RefreshThreshold() tornerebbe al
+	// 10% proprio sulle entry piu' calde, LastHitAt segnerebbe l'ultimo
+	// refresh invece dell'ultima richiesta vera, e un dominio abituale
+	// smetterebbe di esserlo al primo refresh.
 	if old, replacing := c.entries[key]; replacing {
 		e.HitCount = atomic.LoadUint64(&old.HitCount)
 		e.LastHitAt = atomic.LoadInt64(&old.LastHitAt)
+		e.UsedDays = atomic.LoadUint64(&old.UsedDays)
 	} else if len(c.entries) >= c.config.MaxEntries {
 		// Si sfratta solo quando la chiave e' nuova: sostituire una entry
 		// esistente non fa crescere la mappa.
@@ -308,6 +357,7 @@ func (c *Cache) Stats() Stats {
 		Entries:        n,
 		MaxEntries:     c.config.MaxEntries,
 		Hits:           hits,
+		LateHits:       atomic.LoadUint64(&c.lateHits),
 		Misses:         misses,
 		StaleServes:    atomic.LoadUint64(&c.staleServes),
 		Errors:         atomic.LoadUint64(&c.errs),

@@ -1,6 +1,6 @@
 [Unit]
 Description=DNS Cache - local DNS caching server
-Documentation=https://github.com/uzirox/dns-cache
+Documentation=https://github.com/uzirox76/dns-cache
 After=network-online.target
 Wants=network-online.target
 

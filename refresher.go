@@ -16,13 +16,6 @@ import (
 // maxRefreshPerCycle limita il lavoro di un singolo ciclo di refresh.
 const maxRefreshPerCycle = 500
 
-// refreshMaxIdle: si tiene calda solo la coda di domini che il client ha
-// chiesto di recente. Senza questo limite il refresher rinterroga in eterno
-// ogni entry mai vista una volta -- il refresh stesso la tiene viva, quindi
-// non scade mai fuori dalla cache -- e il tetto per ciclo se lo mangiano le
-// entry fredde invece di quelle che il client sta davvero usando.
-const refreshMaxIdle = time.Hour
-
 // Backoff esponenziale sulle entry che falliscono il refresh: restano
 // scadute, l'ordinamento le rimette in testa e senza backoff si riprovano a
 // ogni ciclo bruciando il tetto sempre sulle stesse.
@@ -100,74 +93,17 @@ func (rf *Refresher) refreshCycle() {
 		return
 	}
 
-	rf.pruneFailures(snapshot)
-
 	now := time.Now()
+	rf.pruneFailures(snapshot)
+	rf.pruneUnused(snapshot, now)
 
-	// La finestra di prefetch non puo' essere piu' stretta dell'intervallo
-	// del refresher: con un TTL di 60s il 10% sono 6 secondi, il tick
-	// successivo arriva quando la entry e' gia' scaduta e il client si becca
-	// un miss. Un intervallo e mezzo garantisce che almeno un tick cada
-	// dentro la finestra.
-	minWindow := rf.interval * 3 / 2
-
-	var toRefresh []*cache.Entry
-	var skippedIdle, skippedBackoff int
-
-	for key, e := range snapshot {
-		lastHit := time.Unix(0, atomic.LoadInt64(&e.LastHitAt))
-		if now.Sub(lastHit) > refreshMaxIdle {
-			skippedIdle++
-			continue
-		}
-		if rf.backingOff(key, now) {
-			skippedBackoff++
-			continue
-		}
-
-		remaining := e.ExpiresAt.Sub(now)
-		if remaining <= 0 {
-			toRefresh = append(toRefresh, e)
-			continue
-		}
-
-		threshold := time.Duration(float64(e.CachedTTL) * e.RefreshThreshold())
-		if threshold < minWindow {
-			threshold = minWindow
-		}
-		// Una entry non puo' essere in finestra da prima di esistere: con
-		// TTL <= minWindow si rinfresca a ogni ciclo, che e' l'unico modo di
-		// tenerla calda.
-		if threshold > e.CachedTTL {
-			threshold = e.CachedTTL
-		}
-		if remaining <= threshold {
-			toRefresh = append(toRefresh, e)
-		}
-	}
-
+	toRefresh, skippedCold, skippedBackoff := rf.selectCandidates(snapshot, now)
 	if len(toRefresh) == 0 {
 		return
 	}
 
-	// Ordinare prima di tagliare: al contrario il cap scarterebbe entry
-	// scelte a caso (l'ordine di iterazione della mappa) proprio quando la
-	// priorita' serve.
-	sort.Slice(toRefresh, func(i, j int) bool {
-		ie := toRefresh[i].IsExpiredAt(now)
-		je := toRefresh[j].IsExpiredAt(now)
-		if ie != je {
-			return ie
-		}
-		return atomic.LoadUint64(&toRefresh[i].HitCount) > atomic.LoadUint64(&toRefresh[j].HitCount)
-	})
-
-	if len(toRefresh) > maxRefreshPerCycle {
-		toRefresh = toRefresh[:maxRefreshPerCycle]
-	}
-
-	log.Printf("[refresher] refreshing %d/%d entries (%d fredde, %d in backoff; top: %s %d hits)",
-		len(toRefresh), len(snapshot), skippedIdle, skippedBackoff,
+	log.Printf("[refresher] refreshing %d/%d entries (%d non abituali, %d in backoff; top: %s %d hits)",
+		len(toRefresh), len(snapshot), skippedCold, skippedBackoff,
 		dns.TypeToString[toRefresh[0].QuestionType]+" "+toRefresh[0].QuestionName,
 		atomic.LoadUint64(&toRefresh[0].HitCount))
 
@@ -191,10 +127,79 @@ func (rf *Refresher) refreshCycle() {
 	}
 
 	wg.Wait()
+}
 
-	if rf.cache.Config().StaleServing {
-		rf.pruneExpired()
+// selectCandidates sceglie le entry da rinfrescare in questo ciclo.
+//
+// Si tengono aggiornati solo i domini abituali (cache.Config.Usual), anche
+// quando non li si chiede da ore: e' lo scopo della cache, averli pronti e
+// freschi quando si torna a usarli. Gli altri scadono e al ritorno sono un
+// miss: tenerli caldi costerebbe query all'upstream per nomi visti una volta.
+//
+// La scadenza da anticipare non e' il TTL ma max(TTL, max_age) dal fetch:
+// fin li' la entry si serve comunque (oltre il TTL rinfrescandola in
+// background, vedi Cache.Get). Con TTL di 60s e max_age di 30 minuti un
+// dominio inattivo si rinfresca ogni 25-30 minuti invece che a ogni ciclo.
+func (rf *Refresher) selectCandidates(snapshot map[string]*cache.Entry, now time.Time) (toRefresh []*cache.Entry, skippedCold, skippedBackoff int) {
+	cfg := rf.cache.Config()
+
+	// La finestra di prefetch non puo' essere piu' stretta dell'intervallo
+	// del refresher: il tick successivo arriverebbe a scadenza gia' passata.
+	// Un intervallo e mezzo garantisce che almeno un tick cada dentro.
+	minWindow := rf.interval * 3 / 2
+
+	type candidate struct {
+		e       *cache.Entry
+		overdue bool
 	}
+	var cands []candidate
+
+	for key, e := range snapshot {
+		if !cfg.Usual(e, now) {
+			skippedCold++
+			continue
+		}
+		if rf.backingOff(key, now) {
+			skippedBackoff++
+			continue
+		}
+
+		life := max(e.CachedTTL, cfg.MaxAge)
+		remaining := e.StoredAt.Add(life).Sub(now)
+		if remaining <= 0 {
+			cands = append(cands, candidate{e, true})
+			continue
+		}
+
+		// Una entry non puo' essere in finestra da prima di esistere: con una
+		// vita <= minWindow si rinfresca a ogni ciclo, che e' l'unico modo di
+		// tenerla calda.
+		threshold := min(max(time.Duration(float64(life)*e.RefreshThreshold()), minWindow), life)
+		if remaining <= threshold {
+			cands = append(cands, candidate{e, false})
+		}
+	}
+
+	// Ordinare prima di tagliare: al contrario il cap scarterebbe entry
+	// scelte a caso (l'ordine di iterazione della mappa) proprio quando la
+	// priorita' serve, per esempio al primo ciclo dopo un riavvio, quando
+	// tutte le abituali ricaricate dal DB sono oltre la scadenza.
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].overdue != cands[j].overdue {
+			return cands[i].overdue
+		}
+		return atomic.LoadUint64(&cands[i].e.HitCount) > atomic.LoadUint64(&cands[j].e.HitCount)
+	})
+
+	if len(cands) > maxRefreshPerCycle {
+		cands = cands[:maxRefreshPerCycle]
+	}
+
+	toRefresh = make([]*cache.Entry, len(cands))
+	for i, c := range cands {
+		toRefresh[i] = c.e
+	}
+	return toRefresh, skippedCold, skippedBackoff
 }
 
 func (rf *Refresher) refreshEntry(e *cache.Entry) {
@@ -278,12 +283,16 @@ func (rf *Refresher) pruneFailures(snapshot map[string]*cache.Entry) {
 	}
 }
 
-func (rf *Refresher) pruneExpired() {
-	snapshot := rf.cache.Snapshot()
-	now := time.Now()
-	for _, e := range snapshot {
-		if e.IsExpiredAt(now) && now.After(e.ExpiresAt.Add(24*time.Hour)) {
-			rf.cache.Delete(e.Key())
+// pruneUnused toglie le entry scadute che nessun client chiede da piu' della
+// finestra dei giorni d'uso. Prima vanno tenute anche se scadute: portano lo
+// storico che decide chi e' abituale, e senza un dominio usato lunedi' e
+// giovedi' non arriverebbe mai a due giorni.
+func (rf *Refresher) pruneUnused(snapshot map[string]*cache.Entry, now time.Time) {
+	window := rf.cache.Config().KeepWindow()
+	for key, e := range snapshot {
+		lastHit := time.Unix(0, atomic.LoadInt64(&e.LastHitAt))
+		if e.IsExpiredAt(now) && now.Sub(lastHit) > window {
+			rf.cache.Delete(key)
 		}
 	}
 }

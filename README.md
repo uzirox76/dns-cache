@@ -7,12 +7,14 @@ A lightweight, high-performance local DNS caching server for Linux. Written in G
 - **Local DNS server** — listens on `:53`, intercepts all DNS queries
 - **In-memory cache** — thread-safe (`sync.RWMutex`), instant lookups
 - **TTL-aware** — respects upstream TTLs with configurable min/max bounds
-- **Stale serving** — serves expired entries if upstream is unreachable (RFC 8767)
-- **Predictive prefetch** — hot domains (more hits) are refreshed earlier (up to 30% of TTL)
-- **Background refresher** — periodically refreshes near-expiry entries, max 5 concurrent
+- **Always-fresh usual domains** — domains you use on at least 2 of the last 7 days are refreshed in the background even while idle, and survive restarts
+- **Serve while refreshing** — past its TTL, an answer up to 30 minutes old is served instantly and re-resolved in the background at the same time
+- **Stale serving** — serves expired entries (up to 24h) if upstream is unreachable (RFC 8767)
+- **Predictive prefetch** — hot domains (more hits) are refreshed earlier
+- **Query coalescing** — identical concurrent queries share a single upstream request
 - **SQLite persistence** — survives restarts, WAL mode, periodic cleanup
 - **Upstream fallback** — tries multiple resolvers (1.1.1.1, 9.9.9.9, etc.) in random order
-- **NXDOMAIN caching** — caches negative responses with SOA MinTTL (RFC 2308)
+- **NXDOMAIN caching** — caches negative responses for min(SOA TTL, SOA MINIMUM) (RFC 2308)
 - **LRU eviction** — drops least recently used entries when cache is full
 - **CLI stats** — `dns-cache -stats` for live JSON stats via Unix socket
 - **Web dashboard** — `http://localhost:8053` with auto-refresh HTML + JSON API
@@ -44,6 +46,9 @@ cache:
   refresh_interval: 30
   stale_serving: true
   max_entries: 10000
+  max_age: 1800          # serve past TTL (refreshing in background) up to this age, seconds
+  keep_min_days: 2       # usual domains: used on at least this many days...
+  keep_window_days: 7    # ...of the last this many days
 persistence:
   db_path: "/var/cache/dns-cache/cache.db"
   cleanup_after_hours: 48
@@ -52,6 +57,8 @@ stats:
 web:
   listen: ":8053"
 ```
+
+All keys are optional: missing ones take the defaults shown above.
 
 ### 3. Install as a systemd service
 
@@ -116,21 +123,22 @@ dns-cache -stats
 
 ### Components
 
-- **`cache/`** — In-memory store with `sync.RWMutex`, TTL checking, LRU eviction, hit tracking
+- **`cache/`** — In-memory store with `sync.RWMutex`, TTL checking, LRU eviction, hit and usage-day tracking
 - **`resolver.go`** — Forwards queries to upstream servers with random-order fallback
 - **`handler.go`** — DNS request handler: cache → forward → save → respond
 - **`persistence.go`** — SQLite backend (WAL mode) for cache durability across restarts
-- **`refresher.go`** — Background goroutine that preemptively refreshes near-expiry entries
+- **`refresher.go`** — Background goroutine that keeps usual domains fresh
 - **`stats/`** — Unix socket stats server + shared `BuildSnapshot()` for CLI and web
 - **`web/`** — HTTP server with HTML dashboard and `/api/stats` JSON endpoint
 
 ### Cache lifecycle
 
 1. Query arrives → check in-memory cache
-2. **Cache hit** → respond immediately with adjusted TTL
-3. **Cache miss** → forward to upstream, store in cache + SQLite, respond
-4. **Upstream error** → serve stale entry if available, otherwise SERVFAIL
-5. **Background** → every 30s, refresh entries nearing expiry (hotter = earlier refresh)
+2. **Cache hit** → respond immediately with the remaining TTL
+3. **Past TTL, answer younger than `max_age`** → respond immediately (TTL 30s) and re-resolve in the background
+4. **Cache miss** → forward to upstream (identical concurrent queries share one request), store in cache + SQLite, respond
+5. **Upstream error** → serve stale entry (up to 24h) if available, otherwise SERVFAIL
+6. **Background** → every 30s, refresh usual domains (used on `keep_min_days` of the last `keep_window_days` days) before their answer gets older than max(TTL, `max_age`)
 
 ## Performance
 

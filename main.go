@@ -76,12 +76,17 @@ func runServer(configPath string) {
 	log.Printf("[start] listen %s, upstreams %v", cfg.Listen, cfg.Upstreams)
 
 	cacheCfg := cache.Config{
-		TTLMin:       cfg.CacheTTLMin(),
-		TTLMax:       cfg.CacheTTLMax(),
-		MaxEntries:   cfg.CacheCfg.MaxEntries,
-		StaleServing: cfg.CacheCfg.StaleServing,
+		TTLMin:         cfg.CacheTTLMin(),
+		TTLMax:         cfg.CacheTTLMax(),
+		MaxEntries:     cfg.CacheCfg.MaxEntries,
+		StaleServing:   cfg.CacheCfg.StaleServing,
+		MaxAge:         cfg.CacheMaxAge(),
+		KeepMinDays:    cfg.CacheCfg.KeepMinDays,
+		KeepWindowDays: cfg.CacheCfg.KeepWindowDays,
 	}
 	c := cache.New(cacheCfg)
+	log.Printf("[start] max_age %v, domini abituali: usati in %d giorni su %d",
+		cacheCfg.MaxAge, cacheCfg.KeepMinDays, cacheCfg.KeepWindowDays)
 
 	if cfg.PersistCfg.DBPath != "" {
 		p, err := NewPersistence(cfg.PersistCfg.DBPath)
@@ -89,7 +94,7 @@ func runServer(configPath string) {
 			log.Fatalf("[persist] init: %v", err)
 		}
 
-		entries, err := p.LoadAll()
+		entries, err := p.LoadAll(cacheCfg.KeepWindow())
 		if err != nil {
 			log.Printf("[persist] load error: %v", err)
 		} else {
@@ -108,8 +113,10 @@ func runServer(configPath string) {
 			persistLoop(c, p, persistStop)
 		}()
 
-		cleanupAfter := time.Duration(cfg.PersistCfg.CleanupAfter) * time.Hour
-		if cleanupAfter > 0 {
+		if cfg.PersistCfg.CleanupAfter > 0 {
+			// Mai sotto la finestra dei giorni d'uso: cancellando prima una
+			// riga se ne andrebbe lo storico che decide chi e' abituale.
+			cleanupAfter := max(time.Duration(cfg.PersistCfg.CleanupAfter)*time.Hour, cacheCfg.KeepWindow())
 			persistWg.Add(1)
 			go func() {
 				defer persistWg.Done()
@@ -194,28 +201,40 @@ func runServer(configPath string) {
 	log.Print("[shutdown] server stopped")
 }
 
+// persistLoop salva ogni 30 secondi le entry cambiate dal giro precedente:
+// rinfrescate (StoredAt) o chieste da un client (LastHitAt, che si muove
+// insieme a hit count e giorni d'uso). Riscriverle tutte a ogni giro, ora che
+// le scadute restano in cache per la finestra dei giorni d'uso, sarebbero
+// megabyte di scritture per righe identiche. Il riferimento si prende prima
+// della scansione, cosi' una modifica durante il salvataggio finisce nel giro
+// dopo invece di perdersi.
 func persistLoop(c *cache.Cache, p *Persistence, stop <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+
+	// Le entry appena caricate dal DB sono gia' salvate cosi' come sono.
+	lastSave := time.Now()
 
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
+			start := time.Now()
+			since := lastSave.UnixNano()
 			var batch []*cache.Entry
 			c.ForEach(func(_ string, e *cache.Entry) bool {
-				if atomic.LoadUint64(&e.HitCount) > 0 {
+				if e.StoredAt.UnixNano() >= since || atomic.LoadInt64(&e.LastHitAt) >= since {
 					batch = append(batch, e)
 				}
 				return true
 			})
-			if len(batch) == 0 {
+			if err := p.SaveBatch(batch); err != nil {
+				// lastSave non avanza: il giro dopo riprova le stesse.
+				log.Printf("[persist] batch error: %v", err)
 				continue
 			}
-			if err := p.SaveBatch(batch); err != nil {
-				log.Printf("[persist] batch error: %v", err)
-			}
+			lastSave = start
 		}
 	}
 }

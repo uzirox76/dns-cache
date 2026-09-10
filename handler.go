@@ -6,6 +6,7 @@ import (
 	"net"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 
 	"dns-cache/cache"
 )
@@ -18,6 +19,12 @@ const maxUDPSize = 1232
 type DNSHandler struct {
 	cache    *cache.Cache
 	resolver *Resolver
+	// inflight accorpa le query identiche che arrivano mentre la prima e'
+	// ancora in volo verso l'upstream: il client ne manda spesso due a pochi
+	// millisecondi di distanza, e senza accorparle partivano due richieste.
+	// Ci passa anche il refresh in background delle entry servite oltre il
+	// TTL, cosi' un miss che arriva nel frattempo aspetta quello.
+	inflight singleflight.Group
 }
 
 func NewDNSHandler(c *cache.Cache, r *Resolver) *DNSHandler {
@@ -35,14 +42,23 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	key := cache.Key(q.Name, q.Qtype)
 
 	if entry, ok := h.cache.Get(key); ok {
+		if entry.IsExpired() {
+			// Oltre il TTL ma entro max_age: si risponde subito con la copia
+			// in cache e intanto la si richiede all'upstream, cosi' i 30-40ms
+			// li aspetta il server e non il client. Se l'IP e' cambiato, gia'
+			// la richiesta successiva trova quello nuovo. La query e' nuova:
+			// quella del client non va usata dopo che l'handler e' tornato.
+			refresh := new(dns.Msg)
+			refresh.SetQuestion(q.Name, q.Qtype)
+			h.inflight.DoChan(key, h.resolveAndCache(refresh, true))
+		}
 		respond(w, req, cache.CopyAndSetTTL(entry.Response, ttlForEntry(entry)))
 		return
 	}
 
-	resp, upstream, rtt, err := h.resolver.Resolve(context.Background(), req)
+	v, err, _ := h.inflight.Do(key, h.resolveAndCache(req, false))
 	if err != nil {
 		h.cache.IncrErrors()
-		log.Printf("[error] resolve %s: %v", q.Name, err)
 
 		if entry, ok := h.cache.GetStale(key); ok {
 			log.Printf("[stale] serving stale for %s (upstream error)", q.Name)
@@ -57,19 +73,40 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	log.Printf("[query] %s %s via %s (%.0fms)",
-		dns.TypeToString[q.Qtype], q.Name, upstream, rtt.Seconds()*1000)
+	// La risposta e' condivisa fra le richieste accorpate e respond() la
+	// modifica (SetReply, OPT, Truncate): ognuna ne prende una copia, anche
+	// la prima, che altrimenti la cambierebbe mentre le altre la copiano.
+	respond(w, req, v.(*dns.Msg).Copy())
+}
 
-	var originalTTL uint32
-	if len(resp.Answer) > 0 {
-		originalTTL = resp.Answer[0].Header().Ttl
+// resolveAndCache ritorna la funzione che interroga l'upstream per msg e mette
+// in cache la risposta. Gira dentro inflight, quindi una volta sola per
+// chiave anche con piu' richieste in attesa. Il refresh in background non
+// logga le risposte, come il refresher: [query] resta la riga di un miss.
+func (h *DNSHandler) resolveAndCache(msg *dns.Msg, background bool) func() (any, error) {
+	q := msg.Question[0]
+	return func() (any, error) {
+		resp, upstream, rtt, err := h.resolver.Resolve(context.Background(), msg)
+		if err != nil {
+			log.Printf("[error] resolve %s: %v", q.Name, err)
+			return nil, err
+		}
+
+		if !background {
+			log.Printf("[query] %s %s via %s (%.0fms)",
+				dns.TypeToString[q.Qtype], q.Name, upstream, rtt.Seconds()*1000)
+		}
+
+		var originalTTL uint32
+		if len(resp.Answer) > 0 {
+			originalTTL = resp.Answer[0].Header().Ttl
+		}
+
+		if isCacheable(resp) {
+			h.cache.Set(q.Name, q.Qtype, resp, originalTTL)
+		}
+		return resp, nil
 	}
-
-	if isCacheable(resp) {
-		h.cache.Set(q.Name, q.Qtype, resp, originalTTL)
-	}
-
-	respond(w, req, resp)
 }
 
 // isCacheable: si cachano solo NOERROR e NXDOMAIN (RFC 2308). SERVFAIL e

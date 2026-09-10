@@ -52,6 +52,7 @@ func NewPersistence(dbPath string) (*Persistence, error) {
 			cached_ttl     INTEGER NOT NULL DEFAULT 0,
 			hit_count      INTEGER DEFAULT 0,
 			last_hit_at    INTEGER NOT NULL DEFAULT 0,
+			used_days      INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (question_name, question_type)
 		)
 	`); err != nil {
@@ -59,6 +60,9 @@ func NewPersistence(dbPath string) (*Persistence, error) {
 	}
 
 	if err := addColumnIfMissing(db, "last_hit_at", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return nil, err
+	}
+	if err := addColumnIfMissing(db, "used_days", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return nil, err
 	}
 
@@ -111,9 +115,11 @@ func (p *Persistence) Close() error {
 	return p.db.Close()
 }
 
-func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
+// LoadAll carica le entry che un client ha chiesto negli ultimi keepWindow,
+// anche se scadute.
+func (p *Persistence) LoadAll(keepWindow time.Duration) ([]*cache.Entry, error) {
 	rows, err := p.db.Query(`
-		SELECT question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at
+		SELECT question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at, used_days
 		FROM cache_entries
 	`)
 	if err != nil {
@@ -135,8 +141,9 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			cachedTTL int64
 			hitCount  uint64
 			lastHitAt int64
+			usedDays  int64
 		)
-		if err := rows.Scan(&qname, &qtype, &data, &storedAt, &origTTL, &cachedTTL, &hitCount, &lastHitAt); err != nil {
+		if err := rows.Scan(&qname, &qtype, &data, &storedAt, &origTTL, &cachedTTL, &hitCount, &lastHitAt, &usedDays); err != nil {
 			log.Printf("[warn] scan row: %v", err)
 			continue
 		}
@@ -155,20 +162,28 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 		}
 		expiresAt := storedTime.Add(cd)
 
-		// Le entry gia' scadute non si caricano. Riempirebbero la cache (e
-		// il tetto per ciclo del refresher) di roba che va comunque
-		// rinterrogata alla prima richiesta del client: dopo una notte a
-		// macchina spenta sono la maggioranza della tabella.
-		if now.After(expiresAt) {
-			skipped++
-			continue
-		}
-
 		// Righe scritte prima che la colonna esistesse: si ripiega su
 		// stored_at, che e' l'ora dell'ultimo refresh e non dell'ultima
 		// richiesta del client, ma e' il meglio che quelle righe sanno dire.
 		if lastHitAt == 0 {
 			lastHitAt = storedTime.UnixNano()
+		}
+
+		// Si ricaricano anche le entry scadute, purche' un client le abbia
+		// chieste dentro la finestra dei giorni d'uso: quelle dei domini
+		// abituali il refresher le rinfresca nei primi cicli, le altre
+		// portano lo storico che serve a diventarlo. Scartandole, come si
+		// faceva prima, dopo una notte a macchina spenta -- tutto scaduto --
+		// si ripartiva da zero.
+		if now.Sub(time.Unix(0, lastHitAt)) > keepWindow {
+			skipped++
+			continue
+		}
+
+		// Righe scritte prima che used_days esistesse: l'unico giorno d'uso
+		// noto e' quello di last_hit_at.
+		if usedDays == 0 {
+			usedDays = int64(cache.PackUsedDays(time.Unix(0, lastHitAt)))
 		}
 
 		msg := new(dns.Msg)
@@ -187,11 +202,12 @@ func (p *Persistence) LoadAll() ([]*cache.Entry, error) {
 			ExpiresAt:    expiresAt,
 			HitCount:     hitCount,
 			LastHitAt:    lastHitAt,
+			UsedDays:     uint64(usedDays),
 		})
 	}
 
 	if skipped > 0 {
-		log.Printf("[persist] skipped %d expired entries", skipped)
+		log.Printf("[persist] skipped %d entries unused for more than %v", skipped, keepWindow)
 	}
 
 	return entries, rows.Err()
@@ -204,10 +220,10 @@ func (p *Persistence) SaveEntry(e *cache.Entry) error {
 	}
 
 	_, err = p.db.Exec(`
-		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at, used_days)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, e.QuestionName, e.QuestionType, data, e.StoredAt.Unix(), e.OriginalTTL, int64(e.CachedTTL.Seconds()),
-		atomic.LoadUint64(&e.HitCount), atomic.LoadInt64(&e.LastHitAt))
+		atomic.LoadUint64(&e.HitCount), atomic.LoadInt64(&e.LastHitAt), int64(atomic.LoadUint64(&e.UsedDays)))
 	return err
 }
 
@@ -222,8 +238,8 @@ func (p *Persistence) SaveBatch(entries []*cache.Entry) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT OR REPLACE INTO cache_entries (question_name, question_type, response_data, stored_at, original_ttl, cached_ttl, hit_count, last_hit_at, used_days)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -236,7 +252,7 @@ func (p *Persistence) SaveBatch(entries []*cache.Entry) error {
 			return err
 		}
 		if _, err := stmt.Exec(e.QuestionName, e.QuestionType, data, e.StoredAt.Unix(), e.OriginalTTL, int64(e.CachedTTL.Seconds()),
-			atomic.LoadUint64(&e.HitCount), atomic.LoadInt64(&e.LastHitAt)); err != nil {
+			atomic.LoadUint64(&e.HitCount), atomic.LoadInt64(&e.LastHitAt), int64(atomic.LoadUint64(&e.UsedDays))); err != nil {
 			return err
 		}
 	}

@@ -242,6 +242,7 @@ var tmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
   <div class="card">
     <div class="label">Hits</div>
     <div class="value green">{{.Cache.Hits}}</div>
+    <div class="sub">di cui {{.Cache.LateHits}} oltre il TTL</div>
   </div>
   <div class="card">
     <div class="label">Misses</div>
@@ -258,6 +259,7 @@ var tmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 </div>
 
 <div class="health-row">
+  <span>Abituali: <span class="count" style="color:#38bdf8">{{.UsualEntries}}</span></span>
   <span>Attive: <span class="count" style="color:#4ade80">{{.ActiveEntries}}</span></span>
   <span>Scadute: <span class="count" style="color:#facc15">{{.ExpiredEntries}}</span></span>
   <span>Uptime: <span class="count">{{.Uptime}}</span></span>
